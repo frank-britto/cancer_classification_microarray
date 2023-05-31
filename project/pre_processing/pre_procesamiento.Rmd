@@ -1,0 +1,305 @@
+---
+title: "Pre procesamiento de datos de GEO"
+output: html_notebook
+---
+
+El presente notebook está basado en el de [Dunning (2020)](https://sbc.shef.ac.uk/geo_tutorial/tutorial.nb.html#Differential_Expression), añadiendole el análisis diferencial de expresión de genes. Se establece un workflow para el pre-procesamiento de los datos del proyecto, empezando con la importación desde GEO utilizando `GEOquery`, realizando un análisis de calidad, seguido del análisis diferencial de expresión de genes, y finalizando con un (intento de) clustering.
+
+## Importando la base de datos
+
+Para el proyecto, se utiliza el dataset *Comparative profiling in 13 muscle disease groups*  con ID = [GSE3307](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE3307). Esta base de datos contiene el perfil transcriptómico de 13 grupos de pacientes con enfermedades musculoesqueléticas. De acuerdo a la documentación:
+
+> "Groups studied are: Normal human skeletal muscle, Acute quadriplegic myopathy (AQM; critical care myopathy), Juvenile dermatomyositis (JDM), Amyotophic lateral sclerosis (ALS), spastic paraplegia (SPG4; spastin), Fascioscapulohumeral muscular dystrophy (FSHD), Emery Dreifuss muscular dystrophy (both X linked recessive emerin form; autosomal dominant Lamin A/C form), Becker muscular dystrophy (partial loss of dystrophin), Duchenne muscular dystrophy (complete loss of dystrophin), Calpain 3 (LGMD2A), dysferlin (LGMD2B), FKRP (glycosylation defect; homozygous for a missense mutation)."
+
+```{r}
+# GEOquery permite recuperar la librería de GEO
+library(GEOquery)
+```
+
+
+```{r}
+id <- "GSE3307"
+gse <- getGEO(id)
+```
+
+Se utilizaron dos plataformas en el estudio:
+
+- GPL96	[HG-U133A] Affymetrix Human Genome U133A Array
+- GPL97	[HG-U133B] Affymetrix Human Genome U133B Array
+
+```{r}
+# Evaluamos cuántas plataformas tiene la base de datos
+length(gse)
+```
+Iniciaremos evaluando la primera plataforma GPL96	[HG-U133A]
+
+```{r}
+gse <- gse[[1]]
+gse
+```
+
+```{r}
+# Información de cada muestra
+pData(gse) 
+```
+```{r}
+# Gene annotations
+fData(gse) 
+```
+
+## Análisis exploratorio de datos
+
+La documentación no incluye información sobre la escala en la que se presentan los datos. Por lo tanto, evaluaremos si se encuentran en escala logarítmica (normalmente, *log2*). Para empezar, creamos un *dataframe* con los datos de expresión, donde cada fila sea una muestra y cada columna un gen. Para ello, evaluamos con la función `exprs`.
+
+
+```{r}
+as.data.frame(as.matrix(t(exprs(gse))))
+```
+
+Evidentemente, los datos no se encontraban previamente transformados a escala logarítimica, por lo que se realizará dicha transformación en escala *log2*. Asimismo, para evaluar si la data se encuentra normalizada, realizaremos un `boxplot`.
+
+```{r}
+exprs(gse) <- log2(exprs(gse))
+boxplot(exprs(gse), outline = FALSE)
+```
+
+```{r}
+db = as.data.frame(as.matrix(t(exprs(gse))))
+```
+
+```{r}
+bp <- boxplot(db[,1:50], outline = FALSE, ylab = 'Nivel de expresión (log)', xaxt = "n")
+tick <- seq_along(bp$names)
+axis(1, at = tick, labels = FALSE)
+text(tick, par("usr")[3] - 3.2, bp$names, srt = 90, xpd = TRUE)
+```
+## Inspección de variables clínicas
+
+Los datos de GEO incluyen información sobre las anotaciones de cada paciente, así como un resumen sobre el protocolo de adquisición de datos. 
+
+```{r}
+library(dplyr)
+sampleInfo <- pData(gse)
+sampleInfo
+```
+
+En la columna *characteristics_ch1* podemos encontrar las anotaciones que indican qué enfermedade muscular presenta cada paciente, por lo que la extraeremos.
+
+```{r}
+sampleInfo <- select(sampleInfo, characteristics_ch1)
+sampleInfo <- rename(sampleInfo, target = characteristics_ch1)
+sampleInfo
+```
+
+Evaluamos el *target* para corregir errores de sintaxis y realizar alguna posible imputación.
+```{r}
+table(sampleInfo$target, useNA = "ifany")
+```
+Por simplicidad, evitamos el uso de 'disease state: '. Además, los 5 datos vacíos corresponden, según la documentación, a la clase dysferlin (LGMD2B)
+
+```{r}
+sampleInfo$target[sampleInfo$target == "disease state:DMD;"] <- "DMD"
+sampleInfo$target[sampleInfo$target == "disease state:FSHD;"] <- "FSHD"
+sampleInfo$target[sampleInfo$target == "disease state:JDM;"] <- "JDM"
+sampleInfo$target[sampleInfo$target == "disease state:NHM;"] <- "Control"
+
+# Según la documentación, las muestras vacías corresponden a dysferlin (LGMD2B)
+sampleInfo$target[sampleInfo$target == ""] <- "LGMD2B"
+
+```
+
+Evaluando nuevamente el *target*.
+
+```{r}
+table(sampleInfo$target, useNA = "ifany")
+```
+
+```{r}
+library(ggplot2)
+data = data.frame(table(sampleInfo$target))
+colnames(data) <- c('Enfermedad', 'Frecuencia')
+ggplot(data, aes(x=Enfermedad, y=Frecuencia)) + 
+  geom_bar(stat = "identity")
+```
+## Análisis exploratorio de datos
+
+En primer lugar, realizaremos una matriz de correlación para evaluar si la data de expresión de genes es suficiente para diferenciar a los diferentes grupos de pacientes.
+
+```{r}
+library(pheatmap)
+corMatrix <- cor(exprs(gse), use = 'c')
+if (all(colnames(corMatrix) == rownames(sampleInfo)) == FALSE){
+  rownames(sampleInfo) <- colnames(corMatrix)
+}
+
+pheatmap(corMatrix, annotation_col = sampleInfo, fontsize_row = 2, fontsize_col = 2)
+```
+Para aprovechar la gama de herramientas que provee `sklearn`, exportamos la data para su análisis en Python.
+
+```{r}
+gene_anot <- fData(gse)
+#View(features) # para seleccionar las columnas de interés
+gene_anot <- select(gene_anot, 'ID', 'GB_ACC', 'Gene Title', 'Gene Symbol')
+```
+
+Migrando a Python para comenzar a realizar análisis no supervisados, exportamos los siguientes archivos:
+
+- `gene_anot`: contiene el código del gen (ID), su código público (Accession number) en GenBank (GB_ACC), el nombre del gen al que corresponde el ID, y su símbolo correspondiente
+- `sampleInfo`: contiene información del *target* para implementar algoritmos supervisados
+- `exprs(gse)`: convertido a dataframe, donde cada fila corresponde a una muestran, y cada columna a un gen. 
+
+```{r}
+write.csv(gene_anot, file = "./GPL96_fData.csv")
+write.csv(sampleInfo, file = "./GPL96_target.csv")
+write.csv(db, file= "./GPL96_features.csv")
+```
+
+
+## Análisis diferencial de expresión de genes
+
+Utilizaremos la librería `limma` para crear una *designMatrix*. Esta es una matriz binaria que genera una fila por cada muestra y una columna por cada grupo. Así, un `1` implica que dicha muestra pertenece a determinada clase.
+
+```{r}
+library(limma)
+design <- model.matrix(~0 + sampleInfo$target)
+colnames(design) <- c("ALS", "AQM", "BMD", "Control", "DMD", "EDMD_AD", "EDMD_XR", "FSHD", "HSP", "JDM", "LGMD2A", "LGMD2B", "LGMD2I")
+design
+```
+[Sha et al (2015)](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4983442/) demuestra que realizar un "filtrado" de los genes que se expresan levemente (valor $\rightarrow$ 0) mejora la sensibilidad. Por el momento, utilizaremos la mediana del nivel de expresión como threshold, de modo que todo valor por debajo del mismo se considerará como baja expresión. **Nota**: cambiar la métrica a una más adecuada para el dataset. [Ritchie et al (2006)](https://bmcbioinformatics.biomedcentral.com/articles/10.1186/1471-2105-7-261) proponen un método asignando *weights* a cada valor, para no descartar mediciones.
+
+```{r}
+# Obtenemos la mediana
+cutoff <- median(exprs(gse))
+
+# Vector TRUE/FALSE según el threshold
+is_expressed <- exprs(gse) > cutoff
+
+# Identificar genes que se expresan en más de una muestra
+keep <- rowSums(is_expressed) > 2
+
+# Evaluamos con cuantos genes trabajaremos para el ADEG
+table(keep)
+```
+```{r}
+gse <- gse[keep,]
+```
+Podemos utilizar la función `lmFit` para estimar los niveles de expresión promedio de cada grupo.
+ 
+```{r}
+fit <- lmFit(exprs(gse), design)
+head(fit$coefficients)
+```
+```{r}
+as.data.frame(t(as.matrix(fit$coefficients)))
+```
+
+```{r}
+i <- 8
+data = as.data.frame(t(as.matrix(fit$coefficients)))
+gene_plot <-ggplot(data, aes(x = rownames(data), y=data[colnames(data)[i]][,])) +
+  geom_bar(stat = "identity")
+print(gene_plot + ggtitle(colnames(data)[i]) + 
+        labs(x = "Enfermedad", y = "Nivel de expresión promedio (log2)"))
+```
+Para analizar si existen **diferencias en la expresión de genes entre grupos**, se debe definir un "contraste" (i.e qué grupos se desean comparar). En este caso, se comparará el control con la distrofia muscular de Duchenne (DMD). **Pendiente:** cómo realizar una comparación múltiple.
+
+
+```{r}
+# makeContrasts(x1, x2) -> x1 con respecto a x2 || x1/x2
+contrasts <- makeContrasts(DMD - Control, levels = design)
+fit2 <- contrasts.fit(fit, contrasts)
+```
+
+Finalmente, se realiza una operación de Bayes empírica para obtener un valor p para el valor de expresión diferencial.
+```{r}
+fit2 <- eBayes(fit2)
+```
+
+Observando los resultados
+
+```{r}
+topTable(fit2)
+```
+Para ver cuántos genes se expresan diferencialmente, utilizamos la función `decideTests`.
+```{r}
+table(decideTests(fit2))
+```
+## Visualizando resultados
+
+Como resultado del análisis diferencial utilizando `limma`, obtenemos una tabla en orden descendiente con los genes que estadísticamente representan la diferencia entre las muestras DMD con respecto al control.
+
+```{r}
+annotations <- fData(gse)
+annotations <- select(annotations, "GB_ACC", "Gene Title", "Gene Symbol")
+fit2$genes <- annotations
+topTable(fit2)
+```
+
+Ploteamos un `volcano plot` ya que es la forma más común de representar los resultados de este análisis.
+
+```{r}
+full_results <- topTable(fit2, number = Inf)
+full_results <- tibble::rownames_to_column(full_results,"ID")
+```
+
+```{r}
+ggplot(full_results, aes(x = logFC, y = B)) + geom_point()
+```
+El eje horizontal *logFC* representa el *fold change* en base 2. Así, un mayor valor de *logFC* indica que determinado gen se expresa con "mayor intensidad". Por su parte, el eje vertical *B* representa la significancia estadística; específicamente, el logaritmo del odds ratio.
+
+Podemos agregar más detalles a este gráfico.
+
+```{r}
+library(ggrepel)
+
+# Consideramos que un valor de p < 0.05 es estadísticamente significativo
+p_cutoff <- 0.05
+
+# Asimismo, consideramos un logFC de 1 como significativo
+fc_cutoff <- 1
+
+full_results$diffexpressed <- "NO"
+
+full_results$diffexpressed[full_results$logFC > 0.3 & full_results$adj.P.Val < 0.05] <- "UP"
+
+full_results$diffexpressed[full_results$logFC < -0.3 & full_results$adj.P.Val < 0.05] <- "DOWN"
+
+topN <- 10
+
+full_results %>%
+  mutate(Rank = 1:n(), Label = ifelse(Rank < topN, GB_ACC, "")) %>%
+
+  ggplot(aes(x = logFC, y = -log10(adj.P.Val), col = diffexpressed, label = Label)) +
+  geom_point(size = 2) + geom_text_repel(col = "black") +
+  scale_color_manual(values = c("#00AFBB", "grey", "#F55C7A"), labels = c("Downregulated", "Not significant", "Upregulated")) 
+
+```
+Finalmente, podemos utilizar el`heatmap` utilizado anteriormente para evaluar si los genes encontrados con el análisis anterior pueden diferenciar entre ambas clases.
+
+```{r}
+# Obtenemos los primeros 10 genes y sus nombres
+ids_of_interest <- mutate(full_results, Rank = 1:n()) %>%
+  filter(Rank < topN) %>%
+  pull(ID)
+
+gene_names <- mutate(full_results, Rank = 1:n()) %>%
+  filter(Rank < topN) %>%
+  pull(GB_ACC)
+```
+
+```{r}
+# Realizaremos el corrMatrix solo para pacientes con DMD y Control
+idx <- which(sampleInfo == "DMD" | sampleInfo == "Control")
+idx2 <- rownames(sampleInfo)[idx]
+
+gene_matrix <- exprs(gse)[ids_of_interest,]
+gene_matrix <- as.data.frame(gene_matrix)[idx2]
+```
+
+```{r}
+pheatmap(gene_matrix,
+         labels_row = gene_names,
+         annotation_col = sampleInfo)
+```
+
+
